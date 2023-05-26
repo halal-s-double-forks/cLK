@@ -46,6 +46,8 @@
 #include "recovery.h"
 #include "bootimg.h"
 #include "fastboot.h"
+#include "version.h"
+#include <menu_keys_detect.h>
 
 #define EXPAND(NAME) #NAME
 #define TARGET(NAME) EXPAND(NAME)
@@ -64,6 +66,7 @@ static const char *emmc_cmdline = " androidboot.emmc=true";
 //static const char *battchg_pause = " androidboot.battchg_pause=true";
 static const char *battchg_pause = " androidboot.mode=offmode_charging";
 
+unsigned boot_into_uefi = 0;
 
 static struct udc_device surf_udc_device = {
 	.vendor_id	= 0x18d1,
@@ -95,6 +98,8 @@ unsigned long long mmc_ptn_offset (unsigned char * name);
 unsigned long long mmc_ptn_size (unsigned char * name);
 void display_shutdown(void);
 
+extern void init_ui(void); // in ui.c
+
 static void ptentry_to_tag(unsigned **ptr, struct ptentry *ptn)
 {
 	struct atag_ptbl_entry atag_ptn;
@@ -108,6 +113,14 @@ static void ptentry_to_tag(unsigned **ptr, struct ptentry *ptn)
 	atag_ptn.flags = ptn->flags;
 	memcpy(*ptr, &atag_ptn, sizeof(struct atag_ptbl_entry));
 	*ptr += sizeof(struct atag_ptbl_entry) / sizeof(unsigned);
+}
+
+void cmd_powerdown(const char *arg, void *data, unsigned sz)
+{
+	dprintf(INFO, "Powering down the device\n");
+	fastboot_okay("Device Powering Down");
+	shutdown();
+	thread_exit(0);
 }
 
 void boot_linux(void *kernel, unsigned *tags, 
@@ -292,8 +305,10 @@ unified_boot:
 	} else {
 		cmdline = DEFAULT_CMDLINE;
 	}
-	dprintf(INFO, "cmdline = '%s'\n", cmdline);
+	strcat(cmdline," clk=" CLK_VERSION);
 
+	dprintf(INFO, "cmdline = '%s'\n", cmdline);
+	
 	dprintf(INFO, "\nBooting Linux\n");
 	boot_linux((void *)hdr->kernel_addr, (void *)TAGS_ADDR,
 		   (const char *)cmdline, board_machtype(),
@@ -313,10 +328,6 @@ int boot_linux_from_flash(void)
 
 	if (target_is_emmc_boot()) {
 		hdr = (struct boot_img_hdr *)EMMC_BOOT_IMG_HEADER_ADDR;
-		if (memcmp(hdr->magic, BOOT_MAGIC, BOOT_MAGIC_SIZE)) {
-			dprintf(CRITICAL, "ERROR: Invalid boot image header\n");
-			return -1;
-		}
 		goto continue_boot;
 	}
 
@@ -326,50 +337,43 @@ int boot_linux_from_flash(void)
 		return -1;
 	}
 
-	if(!boot_into_recovery)
+	if((!boot_into_recovery)&&(!boot_into_uefi))
 	{
-	        ptn = ptable_find(ptable, "boot");
-	        if (ptn == NULL) {
-		        dprintf(CRITICAL, "ERROR: No boot partition found\n");
-		        return -1;
-	        }
+		ptn = ptable_find(ptable, "boot");
+		if (ptn == NULL) {
+			dprintf(CRITICAL, "ERROR: No boot partition found\n");
+			return -1;
+		}
 	}
-	else
+	else if (boot_into_uefi)	//Boot from uefi partition
+	{ 
+		ptn = ptable_find(ptable,"uefi");
+		if (ptn == NULL) {
+			dprintf(CRITICAL,"ERROR: No uefi partition found!\n");
+			boot_into_uefi=0;
+			goto failed;
+		}
+	}
+	else  // Boot to recovery
 	{
-	        ptn = ptable_find(ptable, "recovery");
-	        if (ptn == NULL) {
-		        dprintf(CRITICAL, "ERROR: No recovery partition found\n");
-		        return -1;
-	        }
-	}
-
-	if (flash_read(ptn, offset, buf, page_size)) {
-		dprintf(CRITICAL, "ERROR: Cannot read boot image header\n");
-		return -1;
-	}
-	offset += page_size;
-
-	if (memcmp(hdr->magic, BOOT_MAGIC, BOOT_MAGIC_SIZE)) {
-		dprintf(CRITICAL, "ERROR: Invaled boot image heador\n");
-		return -1;
-	}
-
-	if (hdr->page_size != page_size) {
-		dprintf(CRITICAL, "ERROR: Invaled boot image pagesize. Device pagesize: %d, Image pagesize: %d\n",page_size,hdr->page_size);
-		return -1;
+		ptn = ptable_find(ptable, "recovery");
+		if (ptn == NULL) {
+			dprintf(CRITICAL, "ERROR: No recovery partition found\n");
+			goto failed;
+		}
 	}
 
 	n = ROUND_TO_PAGE(hdr->kernel_size, page_mask);
 	if (flash_read(ptn, offset, (void *)hdr->kernel_addr, n)) {
 		dprintf(CRITICAL, "ERROR: Cannot read kernel image\n");
-		return -1;
+		goto failed;
 	}
 	offset += n;
 
 	n = ROUND_TO_PAGE(hdr->ramdisk_size, page_mask);
 	if (flash_read(ptn, offset, (void *)hdr->ramdisk_addr, n)) {
 		dprintf(CRITICAL, "ERROR: Cannot read ramdisk image\n");
-		return -1;
+		goto failed;
 	}
 	offset += n;
 
@@ -384,6 +388,8 @@ continue_boot:
 	} else {
 		cmdline = DEFAULT_CMDLINE;
 	}
+	strcat(cmdline, " clk=" CLK_VERSION);
+
 	dprintf(INFO, "cmdline = '%s'\n", cmdline);
 
 	/* TODO: create/pass atags to kernel */
@@ -394,6 +400,11 @@ continue_boot:
 		   (void *)hdr->ramdisk_addr, hdr->ramdisk_size);
 
 	return 0;
+failed:
+	dprintf(CRITICAL, "AN IRRECOVERABLE ERROR OCCURED!!! REBOOTING TO BOOTLOADER.");
+	thread_sleep(800);
+	reboot_device(FASTBOOT_MODE);
+	return -1;
 }
 
 void cmd_boot(const char *arg, void *data, unsigned sz)
@@ -421,16 +432,10 @@ void cmd_boot(const char *arg, void *data, unsigned sz)
 	kernel_actual = ROUND_TO_PAGE(hdr.kernel_size, page_mask);
 	ramdisk_actual = ROUND_TO_PAGE(hdr.ramdisk_size, page_mask);
 
-	//cedesmith: this will prevent lk booting lk.bin 
-	//if (page_size + kernel_actual + ramdisk_actual < sz) {
-	//	fastboot_fail("incomplete bootimage");
-	//	return;
-	//}
-
 	memmove((void*) KERNEL_ADDR, ptr + page_size, hdr.kernel_size);
 	memmove((void*) RAMDISK_ADDR, ptr + page_size + kernel_actual, hdr.ramdisk_size);
 
-	fastboot_okay("");
+	fastboot_okay("Booting Linux ...");
 	target_battery_charging_enable(0, 1);
 	udc_stop();
 
@@ -461,6 +466,13 @@ void cmd_erase(const char *arg, void *data, unsigned sz)
 		return;
 	}
 	fastboot_okay("");
+}
+
+void cmd_reset_fbcon(){
+	fbcon_reset();
+}
+void cmd_clear_fbcon(){
+	fbcon_clear();
 }
 
 
@@ -536,11 +548,8 @@ void cmd_flash(const char *arg, void *data, unsigned sz)
 		return;
 	}
 
-	if (!strcmp(ptn->name, "boot") || !strcmp(ptn->name, "recovery")) {
-		if (memcmp((void *)data, BOOT_MAGIC, BOOT_MAGIC_SIZE)) {
-			fastboot_fail("image is not a boot image");
-			return;
-		}
+	if (!strcmp(ptn->name, "boot") || !strcmp(ptn->name, "recovery")
+			|| !strcmp(ptn->name, "uefi")) {
 	}
 
 	if (!strcmp(ptn->name, "system") || !strcmp(ptn->name, "userdata")
@@ -617,6 +626,42 @@ void splash_screen ()
 	}
 }
 
+extern char* generate_serial_from_cid(const char* input);
+extern char update_device_cid(void);
+void aboot_init_fastboot(unsigned usb_init)
+{
+	htcleo_fastboot_init();
+
+	if(!usb_init)
+		udc_init(&surf_udc_device);
+
+	fastboot_register("boot", cmd_boot);
+
+	if (target_is_emmc_boot())
+	{
+		fastboot_register("flash:", cmd_flash_mmc);
+		fastboot_register("erase:", cmd_erase_mmc);
+	}
+	else
+	{
+		fastboot_register("flash:", cmd_flash);
+		fastboot_register("erase:", cmd_erase);
+	}
+
+	fastboot_register("continue", cmd_continue);
+	fastboot_register("reboot", cmd_reboot);
+	fastboot_register("reboot-bootloader", cmd_reboot_bootloader);
+	fastboot_register("powerdown", cmd_powerdown);
+	fastboot_publish("product", TARGET(BOARD));
+	fastboot_publish("kernel", "lk");
+	fastboot_register("reset_fbcon", cmd_reset_fbcon);
+	fastboot_register("clear_fbcon", cmd_clear_fbcon);
+
+	fastboot_init(target_get_scratch_address(), MEMBASE - SCRATCH_ADDR - 0x00100000);
+	udc_start();
+	target_battery_charging_enable(1, 0);
+}
+
 void aboot_init(const struct app_descriptor *app)
 {
 	unsigned reboot_mode = 0;
@@ -647,9 +692,13 @@ void aboot_init(const struct app_descriptor *app)
 	if (keys_get_state(KEY_HOME) != 0)
 		boot_into_recovery = 1;
 	if (keys_get_state(KEY_BACK) != 0)
-		goto fastboot;
-	if (keys_get_state(KEY_CLEAR) != 0)
-		goto fastboot;
+		goto boot_menu;
+	if (keys_get_state(KEY_VOLUMEDOWN) != 0)
+		display_init();
+	if (keys_get_state(KEY_VOLUMEUP) != 0){
+		boot_into_recovery = 0;
+		boot_into_uefi = 1;
+	}
 
 	#if NO_KEYPAD_DRIVER
 	/* With no keypad implementation, check the status of USB connection. */
@@ -664,7 +713,7 @@ void aboot_init(const struct app_descriptor *app)
 	if (reboot_mode == RECOVERY_MODE) {
 		boot_into_recovery = 1;
 	} else if(reboot_mode == FASTBOOT_MODE) {
-		goto fastboot;
+		goto boot_menu;
 	}
 
 	if (target_is_emmc_boot())
@@ -673,41 +722,19 @@ void aboot_init(const struct app_descriptor *app)
 	}
 	else
 	{
+		if (boot_into_recovery == 1){
 		recovery_init();
+		}
 		boot_linux_from_flash();
 	}
 	dprintf(CRITICAL, "ERROR: Could not do normal boot. Reverting "
 		"to fastboot mode.\n");
 
-fastboot:
-	htcleo_fastboot_init();
+boot_menu:
+	display_init();
+	aboot_init_fastboot(usb_init);
+	init_ui();
 
-	if(!usb_init)
-		udc_init(&surf_udc_device);
-
-	fastboot_register("boot", cmd_boot);
-
-	if (target_is_emmc_boot())
-	{
-		fastboot_register("flash:", cmd_flash_mmc);
-		fastboot_register("erase:", cmd_erase_mmc);
-	}
-	else
-	{
-		fastboot_register("flash:", cmd_flash);
-		fastboot_register("erase:", cmd_erase);
-	}
-
-	fastboot_register("continue", cmd_continue);
-	fastboot_register("reboot", cmd_reboot);
-	fastboot_register("reboot-bootloader", cmd_reboot_bootloader);
-	fastboot_publish("product", TARGET(BOARD));
-	fastboot_publish("kernel", "lk");
-
-	//fastboot_init(target_get_scratch_address(), 120 * 1024 * 1024);
-	fastboot_init(target_get_scratch_address(), MEMBASE - SCRATCH_ADDR - 0x00100000);
-	udc_start();
-	target_battery_charging_enable(1, 0);
 }
 
 APP_START(aboot)

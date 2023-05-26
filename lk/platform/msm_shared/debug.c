@@ -48,7 +48,7 @@ void _dputc(char c)
 	uart_putc(0, c);
 #endif
 #if WITH_DEBUG_FBCON && WITH_DEV_FBCON
-	fbcon_putc(c);
+	fbcon_putc(c, 0);
 #endif
 #if WITH_DEBUG_JTAG
 	jtag_dputc(c);
