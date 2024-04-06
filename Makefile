@@ -1,5 +1,5 @@
 
-export VERSION=1.4.0.1
+export VERSION=2.0.0.0
 export TOOLCHAIN_PREFIX=arm-none-eabi-
 
 default: bin/RUU_signed.nbh
@@ -19,7 +19,7 @@ bin/nbgen:
 bin/RUU_signed.nbh: bin/nbgen
 	$(MAKE) -C lk htcleo DEBUG=1
 	cp lk/build-htcleo/lk.bin bin/
-	cd bin ; ./nbgen os.nb
+	cd bin ; ./nbgen os.nb 0 lk.bin
 	cd bin ; ./yang -F RUU_signed.nbh -f os.nb -t 0x400 -s 64 -d PB8110000 -c 11111111 -v CLK$(VERSION) -l WWE
 
 partition:
